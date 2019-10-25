@@ -1,0 +1,372 @@
+---
+title: "Analysis"
+author: "Alexander (Sasha) Pastukhov"
+date: "16 April 2019"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(BayesFactor)
+library(boot)
+library(brms)
+library(car)
+library(dplyr)
+library(extrafont)
+library(forcats)
+library(fs)
+library(jmuOutlier)
+library(ggplot2)
+library(knitr)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+library(predictmeans)
+library(readr)
+library(tibble)
+
+loadfonts(quiet = TRUE)
+```
+
+
+```{r Tabula rasa}
+rm(list = ls())
+```
+
+```{r plotting theme, message=FALSE, warning=FALSE}
+plot_theme <- 
+  theme(text=element_text(family="Arial"), 
+        axis.text.x = element_text(size = 8, colour = 'black'), 
+        axis.text.y = element_text(size = 8, colour = 'black'), 
+        axis.title.x = element_text(size = 10), 
+        axis.title.y = element_text(size = 10), 
+        axis.ticks = element_line(size = 0.24))
+```
+
+# Importing
+CSV-file format:
+
+* `Participant`: unique participant ID
+* `Session` : session timestamp
+* `Block` : block index
+* `Trial` : trial index
+* `OnsetDelay` : randomized stimulus onset delay in seconds.
+* `Bias` : biased direction of rotation for the prime, either _"left"_ or _"right"_.
+* `Shape1`, `Shape2` : shape of, respectively, _prime_ and _probe_ stimuli.
+* `Response`, `Response2` : response about final direction of rotation for, respectively, _prime_ and _probe_.
+* `RT1`, `RT2` : response times.
+
+
+```{r Import}
+read_experimental_csv <- function(filename){
+  observer <- 
+    read_csv(filename,
+             col_types = cols(
+               Participant = col_character(),
+               Session = col_character(),
+               Block = col_integer(),
+               Trial = col_integer(),
+               OnsetDelay = col_double(),
+               Bias = col_character(),
+               Shape1 = col_character(),
+               Shape2 = col_character(),
+               Response1 = col_character(),
+               Response2 = col_character(),
+               RT1 = col_double(),
+               RT2 = col_double()))
+  if (length(unique(observer$Block) > 10)){
+    # first block was a training phase, needs to be dropped
+    observer <- 
+      observer %>%
+      filter(Block != min(Block))
+  }
+  
+  # blocks count start at 1
+  observer %>%
+    rename(Prime = Shape1, Probe = Shape2)
+}
+
+
+results <- 
+  tibble(filename = as.character(dir_ls(path="Data", glob="*.csv"))) %>%
+  group_by(filename) %>%
+  do(read_experimental_csv(.$filename)) %>%
+  mutate(Prime = factor(Prime, levels=c("heavy poles sphere", "stripes-8", "stripes-4", "stripes-2")), 
+         Prime = fct_recode(Prime, Sphere = "heavy poles sphere", "Quadro band"="stripes-8", "Dual band"="stripes-4", "Single band"="stripes-2"), 
+         Probe = factor(Probe, levels=c("heavy poles sphere", "stripes-8", "stripes-4", "stripes-2")), 
+         Probe = fct_recode(Probe, Sphere = "heavy poles sphere", "Quadro band"="stripes-8", "Dual band"="stripes-4", "Single band"="stripes-2"),
+         Survived = Response1 == Response2)
+```
+
+# Psurvival analysis
+
+```{r Psurvival, cache=TRUE}
+lag1_per_participant <-
+  results %>%
+  group_by(Participant, Prime, Probe) %>%
+  summarise(Nsurvived = sum(Survived), 
+            Ntotal = n(), 
+            Psurvival = Nsurvived / Ntotal)
+
+
+bootstrap_within_participant <- function(df, R=2000){
+  # figuring out minimal number of trials
+  # (min is just a precaution, should all be the same though)
+  trial_count <-
+    df %>% 
+    group_by(Participant) %>%
+    summarise(count = n()) %>%
+    pull(count) %>%
+    min(.)
+    
+
+  compute_group_Psurvival <- function(unused_data, index, df){
+    df %>%
+      group_by(Participant) %>%
+      slice(index) %>%
+      summarize(Psurvival = mean(Survived, na.rm=TRUE)) %>%
+      ungroup() %>%
+      summarise(Pgroup = mean(Psurvival)) %>%
+      pull(Pgroup)
+  }
+  
+  bootstrapped_P <- boot(1:trial_count, compute_group_Psurvival, R = R, df=df)
+  
+  bca_CIs <- boot.ci(bootstrapped_P, type="bca")
+  
+  data.frame(Psurvival = compute_group_Psurvival(1:trial_count, 1:trial_count, df),
+             lowerCI = bca_CIs$bca[4], 
+             upperCI = bca_CIs$bca[5])
+}
+```
+
+
+Plotting dependence of Psurvival on prime and probe, analogous to earlier papers.
+
+```{r}
+set.seed(50557539)
+
+lag1 <-
+  results %>%
+  group_by(Prime, Probe) %>%
+  do(bootstrap_within_participant(., 200))
+  
+
+ggplot(data = lag1, aes(x = Probe, y = Psurvival, ymin=lowerCI, ymax=upperCI, color = Prime, group = Prime)) + 
+  geom_errorbar(width=0.1) +
+  geom_line() +
+  geom_point() +
+  scale_color_manual(values = c("#ed1c24", "#2ba543", "#293d9b", "#f68712")) + 
+  plot_theme + 
+  theme(legend.position = c(0.1, 0.2), axis.text.x = element_blank())
+```
+
+Formal statistical analysis of the dependence
+
+```{r cache=TRUE}
+set.seed(17181897)
+
+survival <-
+  results %>%
+  group_by(Participant, Prime, Probe) %>%
+  summarise(Nsurvived = sum(Survived), 
+            Ntotal = n(), 
+            Psurvival = Nsurvived/Ntotal, 
+            Plogit = logit(Psurvival, adjust=0.025))
+
+`random effects` <- lme4::glmer(cbind(Nsurvived, Ntotal) ~  (1|Participant), data= survival,  family=binomial)
+`+ prime` <- update(`random effects`, .~. + Prime)
+`+ probe` <- update(`+ prime`, .~. + Probe)
+`+ prime:probe` <- update(`+ probe`, .~. + Prime:Probe)
+anova_table <- anova(`random effects`, `+ prime`, `+ probe`, `+ prime:probe`)
+
+models <- list(`random effects`, `+ prime`, `+ probe`, `+ prime:probe`)
+
+anova_table$R2lr <- NA
+anova_table$BF <- NA
+for(imodel1 in seq(2, length(models))){
+  anova_table$R2lr[imodel1] <-  as.numeric(r.squaredLR(models[[imodel1]], null=`random effects`))
+  anova_table$BF[imodel1] <-exp((BIC(models[[imodel1-1]]) - BIC(models[[imodel1]]))/2)
+}
+
+kable(data.frame(anova_table), digits=c(0, 1, 1, 1, 1, 1, 0, 4, 2, 2))
+```
+
+
+## (Dis)similarity analysis
+
+```{r Grouped by prime or probe shape}
+lag1_Prime <-
+  results %>%
+  group_by(Participant, Prime) %>%
+  summarise(Psurvival = mean(Survived), 
+            Part = "prime") %>%
+  ungroup() %>%
+  rename(Shape = Prime) 
+
+
+lag1_Probe <-
+  results %>%
+  group_by(Participant, Probe) %>%
+  summarise(Psurvival = mean(Survived), 
+            Part = "probe") %>%
+  ungroup() %>%
+  rename(Shape = Probe) 
+
+lag1_both <-
+  rbind(lag1_Prime, lag1_Probe)
+
+cor.test(lag1_Prime$Psurvival, lag1_Probe$Psurvival)
+correlationBF(lag1_Prime$Psurvival, lag1_Probe$Psurvival)
+  
+ggplot(data = lag1_both, aes(x = Shape, y = Psurvival, color = Shape)) + 
+  geom_boxplot() +
+  geom_point(position = position_dodge2(width=0.1)) + 
+  scale_color_manual(values = c("#ed1c24", "#2ba543", "#293d9b", "#f68712")) + 
+  facet_grid(.~Part) +
+  plot_theme + 
+  theme(legend.position = "none", axis.text.x = element_blank())
+```
+
+
+```{r Dissimilarity index}
+dissimilarity <- 
+  results %>%
+  mutate(Dissimilarity = abs(as.integer(Prime) - as.integer(Probe))) %>%
+  group_by(Participant, Dissimilarity) %>%
+  summarise(Nsurvived = sum(Survived), 
+            Ntotal = n(),
+            Psurvival = mean(Survived), 
+            Plogit = car::logit(Psurvival, , adjust=0.025))
+
+ggplot(data = dissimilarity, aes(x = Dissimilarity, y = Psurvival)) + 
+  geom_boxplot(width = 0.5, aes(group=Dissimilarity)) +
+  geom_point(position = position_dodge2(width=0.1)) + 
+  geom_smooth(method="lm", se=FALSE) + 
+  plot_theme
+
+`random effects` <- lme4::glmer(cbind(Nsurvived, Ntotal) ~ (1|Participant), data= dissimilarity,  family=binomial)
+`+ dissimilarity` <- update(`random effects`, .~. + Dissimilarity)
+anova(`random effects`, `+ dissimilarity`)
+
+r.squaredLR(`+ dissimilarity`, null=`random effects`)
+
+set.seed(91084893) 
+dissimilarity$Participant <- as.factor(as.numeric(as.factor(dissimilarity$Participant)))
+bf_random <- lmBF(Plogit ~ Participant, data=dissimilarity, whichRandom = "Participant")
+bf_dissimilarity <- lmBF(Plogit ~ Participant + Dissimilarity, data=dissimilarity, whichRandom = "Participant")
+extractBF(bf_dissimilarity) / extractBF(bf_random)
+```
+
+## Comparison to prior work
+
+```{r}
+persistence <- 
+  survival %>%
+  group_by(Prime, Probe) %>%
+  summarise(Psurvival = mean(Psurvival))
+```
+
+
+```{r}
+sensory_memory <- read_csv("Prior work/bands-sensory-memory.csv", 
+                           col_types=cols(Participant = col_character(),
+                                          Prime = col_character(),
+                                          Probe = col_character(),
+                                          Nsurvived = col_double(),
+                                          Ntotal = col_double()))
+
+
+sensory_memory_p <-
+  sensory_memory %>%
+  mutate(Psurvival = Nsurvived/Ntotal) %>%
+  mutate(Prime = as.factor(Prime),
+         Prime = fct_recode(Prime, "Quadro band"="Quadro", "Dual band"="Dual", "Single band"="Single"),
+         Prime = fct_relevel(Prime, "Sphere", "Quadro band", "Dual band", "Single band"), 
+         Probe = as.factor(Probe),
+         Probe = fct_recode(Probe, "Quadro band"="Quadro", "Dual band"="Dual", "Single band"="Single"),
+         Probe = fct_relevel(Probe, "Sphere", "Quadro band", "Dual band", "Single band")) %>%
+  group_by(Prime, Probe) %>%
+  summarise(Pmemory = mean(Psurvival))
+
+ggplot(data=sensory_memory_p,
+       aes(x = Probe, y = Pmemory, color=Prime, group=Prime)) + 
+  geom_line()+
+  geom_point()
+
+
+persistence_memory <-
+  left_join(persistence, sensory_memory_p, by=c("Prime", "Probe"))
+  
+
+set.seed(63833568)
+perm.cor.test(persistence_memory$Psurvival, persistence_memory$Pmemory)
+cor.test(persistence_memory$Psurvival, persistence_memory$Pmemory)
+correlationBF(persistence_memory$Psurvival, persistence_memory$Pmemory)
+```
+
+```{r}
+adaptation <- read_csv("Prior work/bands-adaptation.csv", 
+                           col_types=cols(Participant = col_character(),
+                                          Prime = col_character(),
+                                          Probe = col_character(),
+                                          Nsurvived = col_double(),
+                                          Ntotal = col_double()))
+
+
+adaptation_p <-
+  adaptation %>%
+  mutate(Psurvival = Nsurvived/Ntotal) %>%
+   mutate(Prime = as.factor(Prime),
+         Prime = fct_recode(Prime, "Quadro band"="Quadro", "Dual band"="Dual", "Single band"="Single"),
+         Prime = fct_relevel(Prime, "Sphere", "Quadro band", "Dual band", "Single band"), 
+         Probe = as.factor(Probe),
+         Probe = fct_recode(Probe, "Quadro band"="Quadro", "Dual band"="Dual", "Single band"="Single"),
+         Probe = fct_relevel(Probe, "Sphere", "Quadro band", "Dual band", "Single band")) %>%
+  group_by(Prime, Probe) %>%
+  summarise(Padaptation = mean(Psurvival))
+  
+ggplot(data = adaptation_p, 
+       aes(x = Probe, y = Padaptation, color=Prime, group=Prime)) + 
+  geom_line()+
+  geom_point()
+
+persistence_adaptation <- left_join(persistence, adaptation_p, by=c("Prime", "Probe"))
+
+
+set.seed(45949786)
+perm.cor.test(persistence_adaptation$Psurvival, persistence_adaptation$Padaptation)
+cor.test(persistence_adaptation$Psurvival, persistence_adaptation$Padaptation)
+correlationBF(persistence_adaptation$Psurvival, persistence_adaptation$Padaptation)
+```
+
+
+```{r}
+history_effects <-
+  rbind(persistence_memory %>%
+              mutate(Effect = "sensory memory") %>%
+              rename(Peffect = Pmemory),
+            persistence_adaptation %>%
+              mutate(Effect = "adaptation") %>%
+              rename(Peffect = Padaptation))
+  
+  
+
+ggplot(history_effects, aes(x = Psurvival, y=Peffect, group=Effect, color=Effect)) + 
+  geom_point() + 
+  geom_smooth(method = "lm") + 
+  plot_theme +
+  theme(legend.position = "none") + 
+  ylab("Psurvival memory/adaptation") +
+  xlab("Psurvival persistence") + 
+  scale_y_continuous(breaks = seq(0.2, 0.9, 0.1)) + 
+  ylim(0, 1)+ xlim(0.5, 1)
+```
+```
